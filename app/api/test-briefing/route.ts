@@ -63,6 +63,19 @@ function checkTwilioConfig(): { ok: boolean; missing: string[] } {
   return { ok: missing.length === 0, missing }
 }
 
+// Safe diagnostic snapshot — no secret values exposed
+function twilioConfigDiagnostic() {
+  const sid = process.env.TWILIO_ACCOUNT_SID ?? ''
+  const token = process.env.TWILIO_AUTH_TOKEN ?? ''
+  return {
+    twilioAccountSidPrefix: sid ? sid.slice(0, 6) : null,
+    twilioFrom: process.env.TWILIO_WHATSAPP_FROM ?? null,
+    whatsappTo: process.env.WHATSAPP_TO ?? null,
+    hasTwilioAuthToken: token.length > 0,
+    twilioAuthTokenLength: token.length > 0 ? token.length : null,
+  }
+}
+
 // Attempt WhatsApp send — returns structured result, never throws
 async function attemptSend(
   messages: WhatsAppMessage[],
@@ -142,6 +155,7 @@ export async function POST(request: NextRequest) {
           sent: false,
           sentReason: 'send_not_requested' as SentReason,
           note: 'Briefing already exists for today. Pass send:true to send it.',
+          twilioConfig: twilioConfigDiagnostic(),
         })
       }
 
@@ -161,6 +175,7 @@ export async function POST(request: NextRequest) {
         whatsappMessageCount: whatsappMessages.length,
         ...sendOutcome,
         note: 'Reused existing briefing for today.',
+        twilioConfig: twilioConfigDiagnostic(),
       })
     }
 
@@ -261,6 +276,7 @@ export async function POST(request: NextRequest) {
       whatsappMessageCount: whatsappMessages.length,
       ...sendOutcome,
       briefing: finalBriefing.content,
+      twilioConfig: twilioConfigDiagnostic(),
     })
   } catch (err) {
     const errorMsg = serializeError(err)
