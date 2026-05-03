@@ -1,5 +1,7 @@
 # Briefing 7
 
+> V1 — Mai 2026
+
 Outil personnel de veille stratégique automatisée. Génère chaque matin à **7h00 (heure Paris)** un briefing synthétique sur l'IA, le business, l'investissement et l'immobilier, puis l'envoie sur **WhatsApp via Twilio** et l'archive dans **Supabase**.
 
 ---
