@@ -20,6 +20,12 @@ import type { WhatsAppMessage } from '@/types/briefing'
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
+type SentReason =
+  | 'sent'
+  | 'send_not_requested'
+  | 'missing_twilio_config'
+  | 'twilio_error'
+
 const RequestBodySchema = z.object({
   send: z.boolean().optional().default(false),
 })
@@ -31,17 +37,62 @@ function isAuthorized(request: NextRequest): boolean {
   return auth === `Bearer ${secret}`
 }
 
-// Serialize any error type to a readable string — avoids "[object Object]"
+// Serialize any error type — avoids "[object Object]"
 function serializeError(err: unknown): string {
   if (err instanceof Error) return err.message
   if (typeof err === 'string') return err
   if (err && typeof err === 'object') {
-    // Supabase PostgrestError shape: { message, details, hint, code }
     const e = err as Record<string, unknown>
     if (e.message) return String(e.message)
     try { return JSON.stringify(err) } catch { /* fallthrough */ }
   }
   return String(err)
+}
+
+// Returns names of missing Twilio env vars — never the values
+function checkTwilioConfig(): { ok: boolean; missing: string[] } {
+  const required: Record<string, string | undefined> = {
+    TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID,
+    TWILIO_AUTH_TOKEN: process.env.TWILIO_AUTH_TOKEN,
+    TWILIO_WHATSAPP_FROM: process.env.TWILIO_WHATSAPP_FROM,
+    WHATSAPP_TO: process.env.WHATSAPP_TO,
+  }
+  const missing = Object.entries(required)
+    .filter(([, v]) => !v)
+    .map(([k]) => k)
+  return { ok: missing.length === 0, missing }
+}
+
+// Attempt WhatsApp send — returns structured result, never throws
+async function attemptSend(
+  messages: WhatsAppMessage[],
+  briefingId: string
+): Promise<{ sent: boolean; sentReason: SentReason; sentError?: string; messagesSent?: number }> {
+  const config = checkTwilioConfig()
+  if (!config.ok) {
+    const detail = `Missing: ${config.missing.join(', ')}`
+    console.warn(`[twilio] Config incomplete — ${detail}`)
+    await logEvent({ status: 'warning', step: 'twilio_config_check', metadata: { missing: config.missing } })
+    return { sent: false, sentReason: 'missing_twilio_config', sentError: detail }
+  }
+
+  try {
+    const result = await sendWhatsAppMessages(messages)
+    await updateBriefingStatus(briefingId, 'sent', new Date().toISOString())
+    await logEvent({
+      status: 'sent',
+      step: 'whatsapp',
+      metadata: { briefingId, messagesSent: result.messagesSent },
+    })
+    console.log(`[twilio] Sent ${result.messagesSent} messages for briefing ${briefingId}`)
+    return { sent: true, sentReason: 'sent', messagesSent: result.messagesSent }
+  } catch (err) {
+    const errorMsg = serializeError(err)
+    console.error(`[twilio] Send failed for briefing ${briefingId}: ${errorMsg}`)
+    await updateBriefingStatus(briefingId, 'failed_to_send')
+    await handleDeliveryFailure(briefingId, errorMsg)
+    return { sent: false, sentReason: 'twilio_error', sentError: errorMsg }
+  }
 }
 
 export async function POST(request: NextRequest) {
@@ -62,54 +113,54 @@ export async function POST(request: NextRequest) {
   const topic = getTopicForToday()
   const dateLabel = formatBriefingDate(getParisNow())
 
-  await logEvent({ status: 'started', step: 'test_briefing', startedAt, metadata: { briefingDate, send: body.send } })
+  // Log Twilio config status at start (no values, just names)
+  const twilioConfig = checkTwilioConfig()
+  console.log(`[test-briefing] send=${body.send} twilioConfigOk=${twilioConfig.ok}${!twilioConfig.ok ? ` missing=[${twilioConfig.missing.join(',')}]` : ''}`)
+
+  await logEvent({
+    status: 'started',
+    step: 'test_briefing',
+    startedAt,
+    metadata: { briefingDate, send: body.send, twilioConfigOk: twilioConfig.ok },
+  })
 
   try {
-    // ── Check if a briefing already exists for today ──────────────────────────
+    // ── Reuse existing briefing for today if it exists ────────────────────────
     const existing = await getBriefingByDate(briefingDate)
 
     if (existing) {
-      // Reuse the existing briefing — skip generation and Supabase writes
       const whatsappMessages = (existing.whatsapp_messages ?? []) as WhatsAppMessage[]
 
-      if (body.send) {
-        if (whatsappMessages.length === 0) {
-          return NextResponse.json(
-            { error: 'Existing briefing has no whatsapp_messages stored — cannot send.' },
-            { status: 422 }
-          )
-        }
-        try {
-          const sendResult = await sendWhatsAppMessages(whatsappMessages)
-          await updateBriefingStatus(existing.id!, 'sent', new Date().toISOString())
-          await logEvent({ status: 'sent', step: 'whatsapp_reuse', metadata: { briefingId: existing.id, messagesSent: sendResult.messagesSent } })
-          return NextResponse.json({
-            success: true,
-            reused: true,
-            briefingId: existing.id,
-            briefingDate,
-            whatsappMessageCount: whatsappMessages.length,
-            sent: true,
-            note: 'Reused existing briefing for today.',
-          })
-        } catch (err) {
-          const errorMsg = serializeError(err)
-          await updateBriefingStatus(existing.id!, 'failed_to_send')
-          await handleDeliveryFailure(existing.id!, errorMsg)
-          return NextResponse.json({ error: 'WhatsApp send failed', detail: errorMsg }, { status: 502 })
-        }
+      if (!body.send) {
+        return NextResponse.json({
+          success: true,
+          reused: true,
+          briefingId: existing.id,
+          briefingDate,
+          status: existing.status,
+          whatsappMessageCount: whatsappMessages.length,
+          sent: false,
+          sentReason: 'send_not_requested' as SentReason,
+          note: 'Briefing already exists for today. Pass send:true to send it.',
+        })
       }
 
-      // send:false — just return the existing briefing info
+      if (whatsappMessages.length === 0) {
+        return NextResponse.json(
+          { error: 'Existing briefing has no whatsapp_messages stored — cannot send.' },
+          { status: 422 }
+        )
+      }
+
+      const sendOutcome = await attemptSend(whatsappMessages, existing.id!)
       return NextResponse.json({
         success: true,
         reused: true,
         briefingId: existing.id,
         briefingDate,
-        status: existing.status,
         whatsappMessageCount: whatsappMessages.length,
-        sent: false,
-        note: 'Briefing already exists for today. Pass send:true to send it.',
+        ...sendOutcome,
+        note: 'Reused existing briefing for today.',
       })
     }
 
@@ -123,7 +174,7 @@ export async function POST(request: NextRequest) {
     // 2. Generate
     const generated = await generateBriefing({ dateLabel, topic, sources: deduped })
 
-    // 3. Quality check
+    // 3. Quality check (one retry allowed)
     const qualityResult = validateBriefingQuality(generated, topic)
     let finalBriefing = generated
 
@@ -185,18 +236,14 @@ export async function POST(request: NextRequest) {
       action_suggested: finalBriefing.opportunity.actionSuggested,
     })
 
-    // 6. Optionally send on WhatsApp
-    let sendResult = null
+    // 6. Send or skip WhatsApp
+    let sendOutcome: Awaited<ReturnType<typeof attemptSend>> = {
+      sent: false,
+      sentReason: 'send_not_requested',
+    }
+
     if (body.send) {
-      try {
-        sendResult = await sendWhatsAppMessages(whatsappMessages)
-        await updateBriefingStatus(briefingRow.id!, 'sent', new Date().toISOString())
-        await logEvent({ status: 'sent', step: 'whatsapp', metadata: { messagesSent: sendResult.messagesSent } })
-      } catch (err) {
-        const errorMsg = serializeError(err)
-        await updateBriefingStatus(briefingRow.id!, 'failed_to_send')
-        await handleDeliveryFailure(briefingRow.id!, errorMsg)
-      }
+      sendOutcome = await attemptSend(whatsappMessages, briefingRow.id!)
     } else {
       await updateBriefingStatus(briefingRow.id!, 'quality_check_passed')
     }
@@ -212,9 +259,8 @@ export async function POST(request: NextRequest) {
       wordCount: finalBriefing.wordCount,
       qualityScore: qualityResult.score,
       whatsappMessageCount: whatsappMessages.length,
-      sent: body.send ? sendResult?.success ?? false : false,
+      ...sendOutcome,
       briefing: finalBriefing.content,
-      whatsappMessages,
     })
   } catch (err) {
     const errorMsg = serializeError(err)
