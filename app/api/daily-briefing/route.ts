@@ -68,7 +68,7 @@ export async function GET(request: NextRequest) {
   try {
     // 3. Collect and score sources
     await logEvent({ status: 'started', step: 'search' })
-    let rawResults = []
+    let rawResults: Awaited<ReturnType<typeof searchWeb>> = []
     try {
       rawResults = await searchWeb(`${topic.searchFocus} ${briefingDate}`, { maxResults: 15 })
     } catch (searchError) {

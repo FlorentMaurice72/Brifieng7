@@ -20,7 +20,7 @@ function getSupabaseClient() {
 }
 
 // Lazily initialised singleton — safe because Next.js API routes are server-only
-let _client: ReturnType<typeof createClient> | null = null
+let _client: ReturnType<typeof getSupabaseClient> | null = null
 export function getClient() {
   if (!_client) _client = getSupabaseClient()
   return _client
