@@ -5,6 +5,31 @@ import type { TopicConfig } from '@/config/topics'
 import { buildSystemPrompt, buildUserPrompt } from '@/lib/prompts'
 import { logUsage } from '@/lib/usage'
 
+// ── AI error classification ───────────────────────────────────────────────────
+
+export type AIErrorCode =
+  | 'anthropic_auth_error'
+  | 'anthropic_model_invalid'
+  | 'anthropic_rate_limit'
+  | 'anthropic_request_error'
+  | 'anthropic_server_error'
+
+export class AIError extends Error {
+  readonly code: AIErrorCode
+  readonly httpStatus: number
+  constructor(code: AIErrorCode, message: string, httpStatus: number) {
+    super(message)
+    this.name = 'AIError'
+    this.code = code
+    this.httpStatus = httpStatus
+  }
+}
+
+export interface GenerateBriefingResult {
+  briefing: GeneratedBriefing
+  aiMode: 'real' | 'mock'
+}
+
 // ── AI provider abstraction ───────────────────────────────────────────────────
 
 interface AIMessage {
@@ -21,19 +46,30 @@ interface AIResponse {
 async function callAnthropic(system: string, messages: AIMessage[]): Promise<AIResponse> {
   const Anthropic = (await import('@anthropic-ai/sdk')).default
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  const model = process.env.AI_MODEL ?? 'claude-sonnet-4-6'
 
-  const response = await client.messages.create({
-    model: process.env.AI_MODEL ?? 'claude-sonnet-4-6',
-    max_tokens: 4096,
-    system,
-    messages,
-  })
-
-  const content = response.content[0]?.type === 'text' ? response.content[0].text : ''
-  return {
-    content,
-    inputTokens: response.usage.input_tokens,
-    outputTokens: response.usage.output_tokens,
+  try {
+    const response = await client.messages.create({ model, max_tokens: 4096, system, messages })
+    const content = response.content[0]?.type === 'text' ? response.content[0].text : ''
+    return { content, inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens }
+  } catch (err: unknown) {
+    const status = (err as { status?: number }).status
+    const msg = err instanceof Error ? err.message : String(err)
+    if (status === 401) throw new AIError('anthropic_auth_error',
+      'Anthropic API key invalid or missing (HTTP 401) — check ANTHROPIC_API_KEY in Vercel env vars', 401)
+    if (status === 403) throw new AIError('anthropic_request_error',
+      `Anthropic permission denied (HTTP 403): ${msg}`, 403)
+    if (status === 404) throw new AIError('anthropic_model_invalid',
+      `Model not found: "${model}" (HTTP 404) — check AI_MODEL env var (e.g. claude-sonnet-4-6)`, 404)
+    if (status === 400) throw new AIError('anthropic_request_error',
+      `Invalid Anthropic request (HTTP 400): ${msg}`, 400)
+    if (status === 429) throw new AIError('anthropic_rate_limit',
+      'Anthropic rate limit exceeded (HTTP 429) — retry later', 429)
+    if (status && status >= 500) throw new AIError('anthropic_server_error',
+      `Anthropic server error (HTTP ${status}): ${msg}`, 500)
+    if (status) throw new AIError('anthropic_request_error',
+      `Anthropic API error (HTTP ${status}): ${msg}`, status)
+    throw err
   }
 }
 
@@ -132,16 +168,15 @@ export async function generateBriefing(params: {
   dateLabel: string
   topic: TopicConfig
   sources: ScoredSource[]
-}): Promise<GeneratedBriefing> {
+}): Promise<GenerateBriefingResult> {
   const provider = process.env.AI_PROVIDER
   const hasApiKey =
     (provider === 'openai' && !!process.env.OPENAI_API_KEY) ||
     (provider !== 'openai' && !!process.env.ANTHROPIC_API_KEY)
 
-  // Use mock in dev when no API key is available
   if (!hasApiKey) {
     console.warn('[briefing-generator] No AI API key configured — returning mock briefing')
-    return buildMockBriefing(params.dateLabel, params.topic)
+    return { briefing: buildMockBriefing(params.dateLabel, params.topic), aiMode: 'mock' }
   }
 
   const system = buildSystemPrompt()
@@ -157,7 +192,6 @@ export async function generateBriefing(params: {
       outputTokens: response.outputTokens,
     })
 
-    // Strip potential markdown code fences before parsing
     const json = response.content.replace(/^```json?\n?/, '').replace(/```$/, '').trim()
     const parsed = JSON.parse(json)
     return GeneratedBriefingSchema.parse(parsed)
@@ -165,15 +199,19 @@ export async function generateBriefing(params: {
 
   // First attempt
   try {
-    return await attempt()
+    const briefing = await attempt()
+    return { briefing, aiMode: 'real' }
   } catch (firstError) {
+    if (firstError instanceof AIError) throw firstError
     console.warn('[briefing-generator] First attempt failed, retrying…', firstError)
   }
 
   // Single retry
   try {
-    return await attempt()
+    const briefing = await attempt()
+    return { briefing, aiMode: 'real' }
   } catch (secondError) {
+    if (secondError instanceof AIError) throw secondError
     throw new Error(`Briefing generation failed after 2 attempts: ${secondError}`)
   }
 }

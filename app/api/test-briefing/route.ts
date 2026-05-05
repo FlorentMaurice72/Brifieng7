@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { getParisDate, formatBriefingDate, getTopicForToday, getParisNow } from '@/lib/date'
 import { searchWeb } from '@/lib/search'
 import { scoreSources, deduplicateSources } from '@/lib/scoring'
-import { generateBriefing } from '@/lib/briefing-generator'
+import { generateBriefing, AIError } from '@/lib/briefing-generator'
 import { validateBriefingQuality } from '@/lib/quality'
 import { splitBriefingForWhatsApp, whatsAppMessagesToString } from '@/lib/whatsapp-format'
 import { sendWhatsAppMessages, handleDeliveryFailure } from '@/lib/twilio'
@@ -187,7 +187,7 @@ export async function POST(request: NextRequest) {
     const deduped = deduplicateSources(scored)
 
     // 2. Generate
-    const generated = await generateBriefing({ dateLabel, topic, sources: deduped })
+    const { briefing: generated, aiMode } = await generateBriefing({ dateLabel, topic, sources: deduped })
 
     // 3. Quality check (one retry allowed)
     const qualityResult = validateBriefingQuality(generated, topic)
@@ -195,7 +195,7 @@ export async function POST(request: NextRequest) {
 
     if (!qualityResult.passed) {
       await logEvent({ status: 'warning', step: 'quality_check', metadata: { issues: qualityResult.issues } })
-      const retried = await generateBriefing({ dateLabel, topic, sources: deduped })
+      const { briefing: retried } = await generateBriefing({ dateLabel, topic, sources: deduped })
       const retryQuality = validateBriefingQuality(retried, topic)
       if (retryQuality.passed) {
         finalBriefing = retried
@@ -274,6 +274,7 @@ export async function POST(request: NextRequest) {
       wordCount: finalBriefing.wordCount,
       qualityScore: qualityResult.score,
       whatsappMessageCount: whatsappMessages.length,
+      aiMode,
       ...sendOutcome,
       briefing: finalBriefing.content,
       twilioConfig: twilioConfigDiagnostic(),
@@ -281,6 +282,12 @@ export async function POST(request: NextRequest) {
   } catch (err) {
     const errorMsg = serializeError(err)
     await logEvent({ status: 'error', step: 'test_briefing', error: errorMsg, startedAt, finishedAt: new Date() })
+    if (err instanceof AIError) {
+      return NextResponse.json(
+        { error: err.code, detail: err.message },
+        { status: err.httpStatus }
+      )
+    }
     return NextResponse.json({ error: 'Internal server error', detail: errorMsg }, { status: 500 })
   }
 }

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getParisDate, formatBriefingDate, getTopicForToday, shouldSendBriefingNow, getParisNow } from '@/lib/date'
 import { searchWeb } from '@/lib/search'
 import { scoreSources, deduplicateSources } from '@/lib/scoring'
-import { generateBriefing } from '@/lib/briefing-generator'
+import { generateBriefing, AIError } from '@/lib/briefing-generator'
 import { validateBriefingQuality } from '@/lib/quality'
 import { splitBriefingForWhatsApp, whatsAppMessagesToString } from '@/lib/whatsapp-format'
 import { sendWhatsAppMessages, handleDeliveryFailure } from '@/lib/twilio'
@@ -82,7 +82,7 @@ export async function GET(request: NextRequest) {
 
     // 4. Generate briefing
     await logEvent({ status: 'started', step: 'generation' })
-    let generated = await generateBriefing({ dateLabel, topic, sources: deduped })
+    let { briefing: generated } = await generateBriefing({ dateLabel, topic, sources: deduped })
     await logEvent({ status: 'success', step: 'generation', metadata: { wordCount: generated.wordCount } })
 
     // 5. Quality check (with one retry)
@@ -91,7 +91,7 @@ export async function GET(request: NextRequest) {
 
     if (!qualityResult.passed) {
       await logEvent({ status: 'warning', step: 'quality_check', metadata: { issues: qualityResult.issues } })
-      generated = await generateBriefing({ dateLabel, topic, sources: deduped })
+      ;({ briefing: generated } = await generateBriefing({ dateLabel, topic, sources: deduped }))
       qualityResult = validateBriefingQuality(generated, topic)
 
       if (!qualityResult.passed) {
@@ -186,6 +186,9 @@ export async function GET(request: NextRequest) {
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err)
     await logEvent({ status: 'error', step: 'cron_daily_briefing', error: errorMsg, startedAt, finishedAt: new Date() })
+    if (err instanceof AIError) {
+      return NextResponse.json({ error: err.code, detail: err.message }, { status: err.httpStatus })
+    }
     return NextResponse.json({ error: 'Pipeline error', detail: errorMsg }, { status: 500 })
   }
 }
