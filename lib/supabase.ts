@@ -50,6 +50,18 @@ export async function insertBriefing(row: Omit<BriefingRow, 'id' | 'created_at' 
   return data
 }
 
+// Upsert on briefing_date — used by test route with force:true to replace existing
+export async function upsertBriefing(row: Omit<BriefingRow, 'id' | 'created_at' | 'updated_at'>): Promise<BriefingRow> {
+  const { data, error } = await getClient()
+    .from('briefings')
+    .upsert({ ...row, updated_at: new Date().toISOString() }, { onConflict: 'briefing_date' })
+    .select()
+    .single()
+
+  if (error) throw error
+  return data
+}
+
 export async function updateBriefingStatus(id: string, status: BriefingStatus, sentAt?: string): Promise<void> {
   const { error } = await getClient()
     .from('briefings')
