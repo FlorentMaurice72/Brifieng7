@@ -48,31 +48,27 @@ async function callAnthropic(system: string, messages: AIMessage[]): Promise<AIR
     const response = await client.messages.create({ model, max_tokens: 4096, system, messages })
     const content = response.content[0]?.type === 'text' ? response.content[0].text : ''
     return { content, inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens }
-  } catch (err) {
-    // Classify using Anthropic SDK typed exceptions (most specific → least specific)
-    if (err instanceof Anthropic.AuthenticationError) {
-      throw new AIError('anthropic_auth_error', 'Anthropic API key invalid or missing (HTTP 401) — check ANTHROPIC_API_KEY in Vercel env vars', 401)
-    }
-    if (err instanceof Anthropic.NotFoundError) {
-      throw new AIError('anthropic_model_invalid', `Model not found: "${model}" (HTTP 404) — check AI_MODEL env var`, 404)
-    }
-    if (err instanceof Anthropic.RateLimitError) {
-      throw new AIError('anthropic_rate_limit', 'Anthropic rate limit exceeded (HTTP 429) — retry later', 429)
-    }
-    if (err instanceof Anthropic.BadRequestError) {
-      const msg = err instanceof Error ? err.message : String(err)
-      throw new AIError('anthropic_request_error', `Invalid Anthropic request (HTTP 400): ${msg}`, 400)
-    }
-    if (err instanceof Anthropic.InternalServerError) {
-      const msg = err instanceof Error ? err.message : String(err)
-      throw new AIError('anthropic_server_error', `Anthropic server error (HTTP 500): ${msg}`, 500)
-    }
-    if (err instanceof Anthropic.APIError) {
-      const status = (err as { status?: number }).status ?? 500
-      const msg = err instanceof Error ? err.message : String(err)
-      throw new AIError('anthropic_request_error', `Anthropic API error (HTTP ${status}): ${msg}`, status)
-    }
-    throw err
+  } catch (err: unknown) {
+    // Duck-type on .status — works regardless of module identity in Next.js bundles
+    const status = (err as { status?: number }).status
+    const msg = err instanceof Error ? err.message : String(err)
+
+    if (status === 401) throw new AIError('anthropic_auth_error',
+      'Anthropic API key invalid or missing (HTTP 401) — check ANTHROPIC_API_KEY in Vercel env vars', 401)
+    if (status === 403) throw new AIError('anthropic_request_error',
+      `Anthropic permission denied (HTTP 403): ${msg}`, 403)
+    if (status === 404) throw new AIError('anthropic_model_invalid',
+      `Model not found: "${model}" (HTTP 404) — check AI_MODEL env var (e.g. claude-sonnet-4-6)`, 404)
+    if (status === 400) throw new AIError('anthropic_request_error',
+      `Invalid Anthropic request (HTTP 400): ${msg}`, 400)
+    if (status === 429) throw new AIError('anthropic_rate_limit',
+      'Anthropic rate limit exceeded (HTTP 429) — retry later', 429)
+    if (status && status >= 500) throw new AIError('anthropic_server_error',
+      `Anthropic server error (HTTP ${status}): ${msg}`, 500)
+    if (status) throw new AIError('anthropic_request_error',
+      `Anthropic API error (HTTP ${status}): ${msg}`, status)
+
+    throw err // network/timeout errors — not an HTTP response, allow retry
   }
 }
 
