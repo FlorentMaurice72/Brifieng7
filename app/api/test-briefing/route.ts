@@ -284,7 +284,18 @@ export async function POST(request: NextRequest) {
     await logEvent({ status: 'error', step: 'test_briefing', error: errorMsg, startedAt, finishedAt: new Date() })
     if (err instanceof AIError) {
       return NextResponse.json(
-        { error: err.code, detail: err.message },
+        {
+          error: err.code,
+          detail: err.message,
+          anthropicDiagnostic: {
+            errorType: err.detail?.anthropicErrorType ?? null,
+            errorMessage: err.detail?.anthropicErrorMessage ?? null,
+            modelUsed: err.detail?.model ?? process.env.AI_MODEL ?? 'claude-sonnet-4-6',
+            hasAnthropicApiKey: !!process.env.ANTHROPIC_API_KEY,
+            anthropicApiKeyLength: process.env.ANTHROPIC_API_KEY?.length ?? 0,
+            aiProvider: process.env.AI_PROVIDER ?? 'anthropic',
+          },
+        },
         { status: err.httpStatus }
       )
     }

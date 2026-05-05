@@ -14,14 +14,22 @@ export type AIErrorCode =
   | 'anthropic_request_error'
   | 'anthropic_server_error'
 
+export interface AIErrorDetail {
+  anthropicErrorType?: string
+  anthropicErrorMessage?: string
+  model?: string
+}
+
 export class AIError extends Error {
   readonly code: AIErrorCode
   readonly httpStatus: number
-  constructor(code: AIErrorCode, message: string, httpStatus: number) {
+  readonly detail?: AIErrorDetail
+  constructor(code: AIErrorCode, message: string, httpStatus: number, detail?: AIErrorDetail) {
     super(message)
     this.name = 'AIError'
     this.code = code
     this.httpStatus = httpStatus
+    this.detail = detail
   }
 }
 
@@ -54,21 +62,32 @@ async function callAnthropic(system: string, messages: AIMessage[]): Promise<AIR
     return { content, inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens }
   } catch (err: unknown) {
     const status = (err as { status?: number }).status
-    const msg = err instanceof Error ? err.message : String(err)
+    // Extract the parsed Anthropic error body (available on SDK APIError as .error)
+    const body = (err as { error?: { error?: { type?: string; message?: string } } }).error
+    const anthropicErrorType = body?.error?.type ?? undefined
+    const anthropicErrorMessage = body?.error?.message ?? undefined
+    const detail: AIErrorDetail = { anthropicErrorType, anthropicErrorMessage, model }
+
     if (status === 401) throw new AIError('anthropic_auth_error',
-      'Anthropic API key invalid or missing (HTTP 401) — check ANTHROPIC_API_KEY in Vercel env vars', 401)
+      'Anthropic API key invalid or missing (HTTP 401) — check ANTHROPIC_API_KEY in Vercel env vars', 401, detail)
     if (status === 403) throw new AIError('anthropic_request_error',
-      `Anthropic permission denied (HTTP 403): ${msg}`, 403)
+      `Anthropic permission denied (HTTP 403): ${anthropicErrorMessage ?? 'see detail'}`, 403, detail)
     if (status === 404) throw new AIError('anthropic_model_invalid',
-      `Model not found: "${model}" (HTTP 404) — check AI_MODEL env var (e.g. claude-sonnet-4-6)`, 404)
-    if (status === 400) throw new AIError('anthropic_request_error',
-      `Invalid Anthropic request (HTTP 400): ${msg}`, 400)
+      `Model not found: "${model}" (HTTP 404) — check AI_MODEL env var`, 404, detail)
+    if (status === 400) {
+      // Some API versions return 400 for invalid model names — detect and reclassify
+      const isModelError = anthropicErrorMessage?.toLowerCase().includes('model') ?? false
+      const code = isModelError ? 'anthropic_model_invalid' : 'anthropic_request_error'
+      throw new AIError(code,
+        `Anthropic 400: ${anthropicErrorType ?? 'invalid_request_error'} — ${anthropicErrorMessage ?? 'see detail'}`,
+        400, detail)
+    }
     if (status === 429) throw new AIError('anthropic_rate_limit',
-      'Anthropic rate limit exceeded (HTTP 429) — retry later', 429)
+      'Anthropic rate limit exceeded (HTTP 429) — retry later', 429, detail)
     if (status && status >= 500) throw new AIError('anthropic_server_error',
-      `Anthropic server error (HTTP ${status}): ${msg}`, 500)
+      `Anthropic server error (HTTP ${status}): ${anthropicErrorMessage ?? 'see detail'}`, 500, detail)
     if (status) throw new AIError('anthropic_request_error',
-      `Anthropic API error (HTTP ${status}): ${msg}`, status)
+      `Anthropic API error (HTTP ${status}): ${anthropicErrorMessage ?? 'see detail'}`, status, detail)
     throw err
   }
 }
