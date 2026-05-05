@@ -128,11 +128,16 @@ Sources principales :
 
 // ── Main generator ────────────────────────────────────────────────────────────
 
+export interface GenerateBriefingResult {
+  briefing: GeneratedBriefing
+  aiMode: 'real' | 'mock'
+}
+
 export async function generateBriefing(params: {
   dateLabel: string
   topic: TopicConfig
   sources: ScoredSource[]
-}): Promise<GeneratedBriefing> {
+}): Promise<GenerateBriefingResult> {
   const provider = process.env.AI_PROVIDER
   const hasApiKey =
     (provider === 'openai' && !!process.env.OPENAI_API_KEY) ||
@@ -141,7 +146,7 @@ export async function generateBriefing(params: {
   // Use mock in dev when no API key is available
   if (!hasApiKey) {
     console.warn('[briefing-generator] No AI API key configured — returning mock briefing')
-    return buildMockBriefing(params.dateLabel, params.topic)
+    return { briefing: buildMockBriefing(params.dateLabel, params.topic), aiMode: 'mock' }
   }
 
   const system = buildSystemPrompt()
@@ -165,14 +170,16 @@ export async function generateBriefing(params: {
 
   // First attempt
   try {
-    return await attempt()
+    const briefing = await attempt()
+    return { briefing, aiMode: 'real' }
   } catch (firstError) {
     console.warn('[briefing-generator] First attempt failed, retrying…', firstError)
   }
 
   // Single retry
   try {
-    return await attempt()
+    const briefing = await attempt()
+    return { briefing, aiMode: 'real' }
   } catch (secondError) {
     throw new Error(`Briefing generation failed after 2 attempts: ${secondError}`)
   }

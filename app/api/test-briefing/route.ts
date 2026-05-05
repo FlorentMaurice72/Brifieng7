@@ -51,7 +51,7 @@ export async function POST(request: NextRequest) {
     const deduped = deduplicateSources(scored)
 
     // 2. Generate
-    const generated = await generateBriefing({ dateLabel, topic, sources: deduped })
+    const { briefing: generated, aiMode } = await generateBriefing({ dateLabel, topic, sources: deduped })
 
     // 3. Quality check
     const qualityResult = validateBriefingQuality(generated, topic)
@@ -59,8 +59,7 @@ export async function POST(request: NextRequest) {
 
     if (!qualityResult.passed) {
       await logEvent({ status: 'warning', step: 'quality_check', metadata: { issues: qualityResult.issues } })
-      // Single retry
-      const retried = await generateBriefing({ dateLabel, topic, sources: deduped })
+      const { briefing: retried } = await generateBriefing({ dateLabel, topic, sources: deduped })
       const retryQuality = validateBriefingQuality(retried, topic)
       if (retryQuality.passed) {
         finalBriefing = retried
@@ -141,6 +140,7 @@ export async function POST(request: NextRequest) {
       briefingId: briefingRow.id,
       briefingDate,
       topic: topic.label,
+      aiMode,
       wordCount: finalBriefing.wordCount,
       qualityScore: qualityResult.score,
       whatsappMessageCount: whatsappMessages.length,

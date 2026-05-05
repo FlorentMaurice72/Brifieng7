@@ -82,7 +82,7 @@ export async function GET(request: NextRequest) {
 
     // 4. Generate briefing
     await logEvent({ status: 'started', step: 'generation' })
-    let generated = await generateBriefing({ dateLabel, topic, sources: deduped })
+    let { briefing: generated } = await generateBriefing({ dateLabel, topic, sources: deduped })
     await logEvent({ status: 'success', step: 'generation', metadata: { wordCount: generated.wordCount } })
 
     // 5. Quality check (with one retry)
@@ -91,7 +91,8 @@ export async function GET(request: NextRequest) {
 
     if (!qualityResult.passed) {
       await logEvent({ status: 'warning', step: 'quality_check', metadata: { issues: qualityResult.issues } })
-      generated = await generateBriefing({ dateLabel, topic, sources: deduped })
+      const { briefing: retried } = await generateBriefing({ dateLabel, topic, sources: deduped })
+      generated = retried
       qualityResult = validateBriefingQuality(generated, topic)
 
       if (!qualityResult.passed) {
