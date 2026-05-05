@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { getParisDate, formatBriefingDate, getTopicForToday, getParisNow } from '@/lib/date'
 import { searchWeb } from '@/lib/search'
 import { scoreSources, deduplicateSources } from '@/lib/scoring'
-import { generateBriefing } from '@/lib/briefing-generator'
+import { generateBriefing, AIError } from '@/lib/briefing-generator'
 import { validateBriefingQuality } from '@/lib/quality'
 import { splitBriefingForWhatsApp, whatsAppMessagesToString } from '@/lib/whatsapp-format'
 import { sendWhatsAppMessages, handleDeliveryFailure } from '@/lib/twilio'
@@ -149,6 +149,10 @@ export async function POST(request: NextRequest) {
       whatsappMessages,
     })
   } catch (err) {
+    if (err instanceof AIError) {
+      await logEvent({ status: 'error', step: 'test_briefing', error: err.message, startedAt, finishedAt: new Date() })
+      return NextResponse.json({ error: err.message, code: err.code }, { status: err.httpStatus })
+    }
     const errorMsg = err instanceof Error ? err.message : String(err)
     await logEvent({ status: 'error', step: 'test_briefing', error: errorMsg, startedAt, finishedAt: new Date() })
     return NextResponse.json({ error: 'Internal server error', detail: errorMsg }, { status: 500 })

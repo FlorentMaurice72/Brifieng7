@@ -5,6 +5,27 @@ import type { TopicConfig } from '@/config/topics'
 import { buildSystemPrompt, buildUserPrompt } from '@/lib/prompts'
 import { logUsage } from '@/lib/usage'
 
+// ── AI error classification ───────────────────────────────────────────────────
+
+export type AIErrorCode =
+  | 'anthropic_auth_error'    // 401 — API key invalid or missing
+  | 'anthropic_model_invalid' // 404 — model ID not found
+  | 'anthropic_rate_limit'    // 429 — rate limited
+  | 'anthropic_request_error' // 400 — malformed request (bad params, schema)
+  | 'anthropic_server_error'  // 500/529 — Anthropic infra issue
+
+export class AIError extends Error {
+  readonly code: AIErrorCode
+  readonly httpStatus: number
+
+  constructor(code: AIErrorCode, message: string, httpStatus: number) {
+    super(message)
+    this.name = 'AIError'
+    this.code = code
+    this.httpStatus = httpStatus
+  }
+}
+
 // ── AI provider abstraction ───────────────────────────────────────────────────
 
 interface AIMessage {
@@ -21,19 +42,37 @@ interface AIResponse {
 async function callAnthropic(system: string, messages: AIMessage[]): Promise<AIResponse> {
   const Anthropic = (await import('@anthropic-ai/sdk')).default
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  const model = process.env.AI_MODEL ?? 'claude-sonnet-4-6'
 
-  const response = await client.messages.create({
-    model: process.env.AI_MODEL ?? 'claude-sonnet-4-6',
-    max_tokens: 4096,
-    system,
-    messages,
-  })
-
-  const content = response.content[0]?.type === 'text' ? response.content[0].text : ''
-  return {
-    content,
-    inputTokens: response.usage.input_tokens,
-    outputTokens: response.usage.output_tokens,
+  try {
+    const response = await client.messages.create({ model, max_tokens: 4096, system, messages })
+    const content = response.content[0]?.type === 'text' ? response.content[0].text : ''
+    return { content, inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens }
+  } catch (err) {
+    // Classify using Anthropic SDK typed exceptions (most specific → least specific)
+    if (err instanceof Anthropic.AuthenticationError) {
+      throw new AIError('anthropic_auth_error', 'Anthropic API key invalid or missing (HTTP 401) — check ANTHROPIC_API_KEY in Vercel env vars', 401)
+    }
+    if (err instanceof Anthropic.NotFoundError) {
+      throw new AIError('anthropic_model_invalid', `Model not found: "${model}" (HTTP 404) — check AI_MODEL env var`, 404)
+    }
+    if (err instanceof Anthropic.RateLimitError) {
+      throw new AIError('anthropic_rate_limit', 'Anthropic rate limit exceeded (HTTP 429) — retry later', 429)
+    }
+    if (err instanceof Anthropic.BadRequestError) {
+      const msg = err instanceof Error ? err.message : String(err)
+      throw new AIError('anthropic_request_error', `Invalid Anthropic request (HTTP 400): ${msg}`, 400)
+    }
+    if (err instanceof Anthropic.InternalServerError) {
+      const msg = err instanceof Error ? err.message : String(err)
+      throw new AIError('anthropic_server_error', `Anthropic server error (HTTP 500): ${msg}`, 500)
+    }
+    if (err instanceof Anthropic.APIError) {
+      const status = (err as { status?: number }).status ?? 500
+      const msg = err instanceof Error ? err.message : String(err)
+      throw new AIError('anthropic_request_error', `Anthropic API error (HTTP ${status}): ${msg}`, status)
+    }
+    throw err
   }
 }
 
@@ -173,14 +212,17 @@ export async function generateBriefing(params: {
     const briefing = await attempt()
     return { briefing, aiMode: 'real' }
   } catch (firstError) {
+    // AIError means the API rejected the request — no point retrying (auth, model, bad params)
+    if (firstError instanceof AIError) throw firstError
     console.warn('[briefing-generator] First attempt failed, retrying…', firstError)
   }
 
-  // Single retry
+  // Single retry (only for transient failures: JSON parse, Zod validation, network blip)
   try {
     const briefing = await attempt()
     return { briefing, aiMode: 'real' }
   } catch (secondError) {
+    if (secondError instanceof AIError) throw secondError
     throw new Error(`Briefing generation failed after 2 attempts: ${secondError}`)
   }
 }
