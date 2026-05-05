@@ -10,6 +10,7 @@ import { sendWhatsAppMessages, handleDeliveryFailure } from '@/lib/twilio'
 import {
   getBriefingByDate,
   insertBriefing,
+  upsertBriefing,
   insertSources,
   insertOpportunity,
   updateBriefingStatus,
@@ -28,6 +29,7 @@ type SentReason =
 
 const RequestBodySchema = z.object({
   send: z.boolean().optional().default(false),
+  force: z.boolean().optional().default(false),
 })
 
 function isAuthorized(request: NextRequest): boolean {
@@ -126,60 +128,62 @@ export async function POST(request: NextRequest) {
   const topic = getTopicForToday()
   const dateLabel = formatBriefingDate(getParisNow())
 
-  // Log Twilio config status at start (no values, just names)
   const twilioConfig = checkTwilioConfig()
-  console.log(`[test-briefing] send=${body.send} twilioConfigOk=${twilioConfig.ok}${!twilioConfig.ok ? ` missing=[${twilioConfig.missing.join(',')}]` : ''}`)
+  const searchMode = (process.env.SEARCH_PROVIDER && process.env.SEARCH_API_KEY) ? 'real' : 'mock'
+  console.log(`[test-briefing] send=${body.send} force=${body.force} searchMode=${searchMode} twilioConfigOk=${twilioConfig.ok}`)
 
   await logEvent({
     status: 'started',
     step: 'test_briefing',
     startedAt,
-    metadata: { briefingDate, send: body.send, twilioConfigOk: twilioConfig.ok },
+    metadata: { briefingDate, send: body.send, force: body.force, searchMode, twilioConfigOk: twilioConfig.ok },
   })
 
   try {
-    // ── Reuse existing briefing for today if it exists ────────────────────────
-    const existing = await getBriefingByDate(briefingDate)
+    // ── Reuse existing briefing (only when force:false) ───────────────────────
+    if (!body.force) {
+      const existing = await getBriefingByDate(briefingDate)
 
-    if (existing) {
-      const whatsappMessages = (existing.whatsapp_messages ?? []) as WhatsAppMessage[]
+      if (existing) {
+        const whatsappMessages = (existing.whatsapp_messages ?? []) as WhatsAppMessage[]
 
-      if (!body.send) {
+        if (!body.send) {
+          return NextResponse.json({
+            success: true,
+            reused: true,
+            briefingId: existing.id,
+            briefingDate,
+            status: existing.status,
+            whatsappMessageCount: whatsappMessages.length,
+            sent: false,
+            sentReason: 'send_not_requested' as SentReason,
+            note: 'Briefing already exists for today. Pass force:true to regenerate.',
+            twilioConfig: twilioConfigDiagnostic(),
+          })
+        }
+
+        if (whatsappMessages.length === 0) {
+          return NextResponse.json(
+            { error: 'Existing briefing has no whatsapp_messages stored — cannot send.' },
+            { status: 422 }
+          )
+        }
+
+        const sendOutcome = await attemptSend(whatsappMessages, existing.id!)
         return NextResponse.json({
           success: true,
           reused: true,
           briefingId: existing.id,
           briefingDate,
-          status: existing.status,
           whatsappMessageCount: whatsappMessages.length,
-          sent: false,
-          sentReason: 'send_not_requested' as SentReason,
-          note: 'Briefing already exists for today. Pass send:true to send it.',
+          ...sendOutcome,
+          note: 'Reused existing briefing for today.',
           twilioConfig: twilioConfigDiagnostic(),
         })
       }
-
-      if (whatsappMessages.length === 0) {
-        return NextResponse.json(
-          { error: 'Existing briefing has no whatsapp_messages stored — cannot send.' },
-          { status: 422 }
-        )
-      }
-
-      const sendOutcome = await attemptSend(whatsappMessages, existing.id!)
-      return NextResponse.json({
-        success: true,
-        reused: true,
-        briefingId: existing.id,
-        briefingDate,
-        whatsappMessageCount: whatsappMessages.length,
-        ...sendOutcome,
-        note: 'Reused existing briefing for today.',
-        twilioConfig: twilioConfigDiagnostic(),
-      })
     }
 
-    // ── No existing briefing — run full pipeline ──────────────────────────────
+    // ── Full pipeline (force:true bypasses reuse) ─────────────────────────────
 
     // 1. Search sources
     const rawResults = await searchWeb(`${topic.searchFocus} ${dateLabel}`, { maxResults: 12 })
@@ -212,8 +216,9 @@ export async function POST(request: NextRequest) {
     const whatsappMessages = splitBriefingForWhatsApp(finalBriefing.content)
     const whatsappContent = whatsAppMessagesToString(whatsappMessages)
 
-    // 5. Save to Supabase
-    const briefingRow = await insertBriefing({
+    // 5. Save to Supabase — upsert when force:true to replace any existing row for today
+    const saveFn = body.force ? upsertBriefing : insertBriefing
+    const briefingRow = await saveFn({
       briefing_date: briefingDate,
       title: finalBriefing.title,
       content: finalBriefing.content,
@@ -268,6 +273,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       success: true,
       reused: false,
+      regenerated: body.force,
       briefingId: briefingRow.id,
       briefingDate,
       topic: topic.label,
@@ -275,6 +281,13 @@ export async function POST(request: NextRequest) {
       qualityScore: qualityResult.score,
       whatsappMessageCount: whatsappMessages.length,
       aiMode,
+      searchMode,
+      sourceCount: deduped.length,
+      mainSources: finalBriefing.mainSources.map((s) => ({
+        title: s.title,
+        url: s.url ?? null,
+        sourceName: s.sourceName ?? null,
+      })),
       ...sendOutcome,
       briefing: finalBriefing.content,
       twilioConfig: twilioConfigDiagnostic(),
