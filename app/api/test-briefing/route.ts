@@ -39,7 +39,6 @@ function isAuthorized(request: NextRequest): boolean {
   return auth === `Bearer ${secret}`
 }
 
-// Serialize any error type — avoids "[object Object]"
 function serializeError(err: unknown): string {
   if (err instanceof Error) return err.message
   if (typeof err === 'string') return err
@@ -51,7 +50,6 @@ function serializeError(err: unknown): string {
   return String(err)
 }
 
-// Returns names of missing Twilio env vars — never the values
 function checkTwilioConfig(): { ok: boolean; missing: string[] } {
   const required: Record<string, string | undefined> = {
     TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID,
@@ -65,7 +63,6 @@ function checkTwilioConfig(): { ok: boolean; missing: string[] } {
   return { ok: missing.length === 0, missing }
 }
 
-// Safe diagnostic snapshot — no secret values exposed
 function twilioConfigDiagnostic() {
   const sid = process.env.TWILIO_ACCOUNT_SID ?? ''
   const token = process.env.TWILIO_AUTH_TOKEN ?? ''
@@ -78,7 +75,6 @@ function twilioConfigDiagnostic() {
   }
 }
 
-// Attempt WhatsApp send — returns structured result, never throws
 async function attemptSend(
   messages: WhatsAppMessage[],
   briefingId: string
@@ -212,9 +208,10 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // 4. Prepare WhatsApp messages
-    const whatsappMessages = splitBriefingForWhatsApp(finalBriefing.content)
+    // 4. Prepare WhatsApp messages — split with 1400-char limit, never truncate
+    const { messages: whatsappMessages, oversizedOriginalIndices } = splitBriefingForWhatsApp(finalBriefing.content)
     const whatsappContent = whatsAppMessagesToString(whatsappMessages)
+    const maxMessageCharCount = Math.max(...whatsappMessages.map((m) => m.charCount), 0)
 
     // 5. Save to Supabase — upsert when force:true to replace any existing row for today
     const saveFn = body.force ? upsertBriefing : insertBriefing
@@ -279,10 +276,12 @@ export async function POST(request: NextRequest) {
       topic: topic.label,
       wordCount: finalBriefing.wordCount,
       qualityScore: qualityResult.score,
-      whatsappMessageCount: whatsappMessages.length,
       aiMode,
       searchMode,
       sourceCount: deduped.length,
+      whatsappMessageCount: whatsappMessages.length,
+      maxMessageCharCount,
+      oversizedMessages: oversizedOriginalIndices,
       mainSources: finalBriefing.mainSources.map((s) => ({
         title: s.title,
         url: s.url ?? null,
