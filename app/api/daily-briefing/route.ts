@@ -109,7 +109,7 @@ export async function GET(request: NextRequest) {
     await logEvent({ status: 'success', step: 'quality_check', metadata: { score: qualityResult.score } })
 
     // 6. Prepare WhatsApp messages
-    const whatsappMessages = splitBriefingForWhatsApp(generated.content)
+ const { messages: whatsappMessages } = splitBriefingForWhatsApp(generated.content)
     const whatsappContent = whatsAppMessagesToString(whatsappMessages)
 
     // 7. Archive to Supabase
