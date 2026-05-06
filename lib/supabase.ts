@@ -3,9 +3,6 @@ import type { BriefingRow, BriefingStatus } from '@/types/briefing'
 import type { SourceRow } from '@/types/source'
 import type { OpportunityRow } from '@/types/opportunity'
 
-// This module must only be imported in server-side code (API routes, server components).
-// SUPABASE_SERVICE_ROLE_KEY must never be exposed to the browser.
-
 function getSupabaseClient() {
   const url = process.env.SUPABASE_URL
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -19,7 +16,6 @@ function getSupabaseClient() {
   })
 }
 
-// Lazily initialised singleton — safe because Next.js API routes are server-only
 let _client: ReturnType<typeof getSupabaseClient> | null = null
 export function getClient() {
   if (!_client) _client = getSupabaseClient()
