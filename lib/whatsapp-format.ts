@@ -1,9 +1,13 @@
 import type { WhatsAppMessage } from '@/types/briefing'
 
-const MAX_CHARS = Number(process.env.MAX_WHATSAPP_CHARS_PER_MESSAGE ?? 1800)
+// Twilio hard limit is 1600. Default to 1400 for a safe margin.
+const TWILIO_HARD_LIMIT = 1599
+const MAX_CHARS = Math.min(
+  Number(process.env.MAX_WHATSAPP_CHARS_PER_MESSAGE ?? 1400),
+  TWILIO_HARD_LIMIT
+)
 const MAX_MESSAGES = Number(process.env.MAX_WHATSAPP_MESSAGES ?? 9)
 
-// Section markers used to split the briefing content
 const SECTION_EMOJI_PREFIXES = [
   { emoji: '🧠', label: 'À apprendre aujourd\'hui' },
   { emoji: '🔥', label: 'Thème prioritaire du jour' },
@@ -16,12 +20,29 @@ const SECTION_EMOJI_PREFIXES = [
   { emoji: '☀️', label: 'Introduction' },
 ]
 
-/**
- * Splits a full briefing text into individual WhatsApp messages.
- * Each section becomes its own message; if it exceeds MAX_CHARS it is truncated with a warning.
- * If the number of sections exceeds MAX_MESSAGES, the last sections are merged.
- */
-export function splitBriefingForWhatsApp(fullContent: string): WhatsAppMessage[] {
+function splitAtWordBoundary(text: string, maxChars: number): string[] {
+  if (text.length <= maxChars) return [text]
+
+  const chunks: string[] = []
+  let remaining = text.trim()
+
+  while (remaining.length > maxChars) {
+    let splitAt = remaining.lastIndexOf('\n', maxChars)
+    if (splitAt <= 0) splitAt = remaining.lastIndexOf(' ', maxChars)
+    if (splitAt <= 0) splitAt = maxChars
+    chunks.push(remaining.slice(0, splitAt).trimEnd())
+    remaining = remaining.slice(splitAt).trimStart()
+  }
+  if (remaining.length > 0) chunks.push(remaining)
+  return chunks
+}
+
+export interface SplitBriefingResult {
+  messages: WhatsAppMessage[]
+  oversizedOriginalIndices: number[]
+}
+
+export function splitBriefingForWhatsApp(fullContent: string): SplitBriefingResult {
   const lines = fullContent.split('\n')
   const sections: { label: string; lines: string[] }[] = []
   let current: { label: string; lines: string[] } | null = null
@@ -37,34 +58,50 @@ export function splitBriefingForWhatsApp(fullContent: string): WhatsAppMessage[]
     } else if (current) {
       current.lines.push(line)
     } else {
-      // Content before first section marker → intro
-      if (!current) {
-        current = { label: 'Introduction', lines: [line] }
-      }
+      current = { label: 'Introduction', lines: [line] }
     }
   }
   if (current) sections.push(current)
 
-  // If we have more sections than MAX_MESSAGES, merge excess into last message
   const trimmed = sections.length > MAX_MESSAGES
     ? mergeExcessSections(sections, MAX_MESSAGES)
     : sections
 
-  return trimmed.map((section, index) => {
-    let content = section.lines.join('\n').trim()
+  const messages: WhatsAppMessage[] = []
+  const oversizedOriginalIndices: number[] = []
+  let messageIndex = 0
 
-    // Hard truncation as a last resort — should not happen if briefing is ≤1200 words
-    if (content.length > MAX_CHARS) {
-      content = content.slice(0, MAX_CHARS - 20) + '\n[...suite tronquée]'
-    }
+  for (let i = 0; i < trimmed.length; i++) {
+    const section = trimmed[i]
+    const content = section.lines.join('\n').trim()
 
-    return {
-      index: index + 1,
-      label: section.label,
-      content,
-      charCount: content.length,
+    if (content.length <= MAX_CHARS) {
+      messageIndex++
+      messages.push({ index: messageIndex, label: section.label, content, charCount: content.length })
+    } else {
+      oversizedOriginalIndices.push(i + 1)
+      const chunks = splitAtWordBoundary(content, MAX_CHARS)
+      const total = chunks.length
+
+      chunks.forEach((chunk, ci) => {
+        messageIndex++
+        const finalContent = ci === 0
+          ? chunk
+          : `_(suite ${ci + 1}/${total})_\n\n${chunk}`
+        const label = ci === 0
+          ? section.label
+          : `${section.label} (suite ${ci + 1}/${total})`
+        messages.push({
+          index: messageIndex,
+          label,
+          content: finalContent,
+          charCount: finalContent.length,
+        })
+      })
     }
-  })
+  }
+
+  return { messages, oversizedOriginalIndices }
 }
 
 function mergeExcessSections(
@@ -80,12 +117,10 @@ function mergeExcessSections(
   return [...head, merged]
 }
 
-/** Returns the total character count across all WhatsApp messages */
 export function totalWhatsAppChars(messages: WhatsAppMessage[]): number {
   return messages.reduce((sum, m) => sum + m.charCount, 0)
 }
 
-/** Joins all WhatsApp messages into a single preview string (for Supabase storage) */
 export function whatsAppMessagesToString(messages: WhatsAppMessage[]): string {
   return messages.map((m) => m.content).join('\n\n─────────────────\n\n')
 }
