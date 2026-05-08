@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getParisDate, formatBriefingDate, getTopicForToday, shouldSendBriefingNow, getParisNow } from '@/lib/date'
+import { getParisDate, formatBriefingDate, getTopicForToday, getParisNow } from '@/lib/date'
 import { searchWeb } from '@/lib/search'
 import { scoreSources, deduplicateSources } from '@/lib/scoring'
 import { generateBriefing, AIError } from '@/lib/briefing-generator'
@@ -31,28 +31,12 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  const skipTimeCheck = request.nextUrl.searchParams.get('skipTimeCheck') === 'true'
-
   const startedAt = new Date()
   const briefingDate = getParisDate()
 
-  await logEvent({ status: 'started', step: 'cron_daily_briefing', startedAt, metadata: { briefingDate, skipTimeCheck } })
+  await logEvent({ status: 'started', step: 'cron_daily_briefing', startedAt, metadata: { briefingDate } })
 
-  // 1. Time guard — only send at 7h Paris (bypassable for manual tests)
-  if (!skipTimeCheck && !shouldSendBriefingNow()) {
-    const parisHour = getParisNow().getHours()
-    await logEvent({
-      status: 'skipped',
-      step: 'time_check',
-      metadata: { reason: 'Not 7h Paris', currentParisHour: parisHour },
-    })
-    return NextResponse.json({
-      skipped: true,
-      reason: `Not send time. Current Paris hour: ${parisHour}. Use ?skipTimeCheck=true to bypass.`,
-    })
-  }
-
-  // 2. Anti-duplicate guard — one briefing per day
+  // Anti-duplicate guard — one briefing per day
   const existing = await getBriefingByDate(briefingDate).catch(() => null)
   if (existing && ['sent', 'quality_check_passed'].includes(existing.status)) {
     await logEvent({
@@ -67,7 +51,7 @@ export async function GET(request: NextRequest) {
   const dateLabel = formatBriefingDate(getParisNow())
 
   try {
-    // 3. Collect and score sources
+    // 1. Collect and score sources
     await logEvent({ status: 'started', step: 'search' })
     let rawResults: Awaited<ReturnType<typeof searchWeb>> = []
     try {
@@ -80,12 +64,12 @@ export async function GET(request: NextRequest) {
     const deduped = deduplicateSources(scored)
     await logEvent({ status: 'success', step: 'search', metadata: { rawCount: rawResults.length, dedupedCount: deduped.length } })
 
-    // 4. Generate briefing
+    // 2. Generate briefing
     await logEvent({ status: 'started', step: 'generation' })
     let { briefing: generated } = await generateBriefing({ dateLabel, topic, sources: deduped })
     await logEvent({ status: 'success', step: 'generation', metadata: { wordCount: generated.wordCount } })
 
-    // 5. Quality check (with one retry)
+    // 3. Quality check (with one retry)
     await logEvent({ status: 'started', step: 'quality_check' })
     let qualityResult = validateBriefingQuality(generated, topic)
 
@@ -107,11 +91,11 @@ export async function GET(request: NextRequest) {
     }
     await logEvent({ status: 'success', step: 'quality_check', metadata: { score: qualityResult.score } })
 
-    // 6. Prepare WhatsApp messages
+    // 4. Prepare WhatsApp messages
     const { messages: whatsappMessages } = splitBriefingForWhatsApp(generated.content)
     const whatsappContent = whatsAppMessagesToString(whatsappMessages)
 
-    // 7. Archive to Supabase
+    // 5. Archive to Supabase
     await logEvent({ status: 'started', step: 'archive' })
     const briefingRow = await insertBriefing({
       briefing_date: briefingDate,
@@ -153,7 +137,7 @@ export async function GET(request: NextRequest) {
 
     await logEvent({ status: 'success', step: 'archive', metadata: { briefingId: briefingRow.id } })
 
-    // 8. Send on WhatsApp
+    // 6. Send on WhatsApp
     await logEvent({ status: 'started', step: 'whatsapp_send' })
     try {
       const sendResult = await sendWhatsAppMessages(whatsappMessages)
@@ -181,7 +165,6 @@ export async function GET(request: NextRequest) {
       wordCount: generated.wordCount,
       qualityScore: qualityResult.score,
       whatsappMessageCount: whatsappMessages.length,
-      skipTimeCheck,
     })
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err)
